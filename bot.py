@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup, Update
@@ -12,6 +13,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_NAME = os.getenv("BOT_NAME", "Football Hub")
+
+CAMBODIA_TZ = timezone(timedelta(hours=7))  # ICT, no daylight saving
 
 RANK_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
@@ -34,7 +37,7 @@ def home_kb():
 
 
 def refresh_kb(section):
-    return kb([Btn("🔄 ធ្វើបច្ចុប្បន្នភាព", callback_data=section)], [HOME_BTN])
+    return kb([Btn("🔄 ធ្វើបច្ចុប្បន្នភាព", callback_data=f"refresh:{section}")], [HOME_BTN])
 
 
 def news_kb():
@@ -178,6 +181,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if action == "lang:km":
         await query.answer("🇰🇭 អ្នកកំពុងប្រើភាសាខ្មែរ")
+        return
+
+    if action.startswith("refresh:"):
+        section = action.split(":", 1)[1]
+        text_fn = {"live": live_text, "results": results_text, "fixtures": fixtures_text}.get(section)
+        if text_fn:
+            now = datetime.now(CAMBODIA_TZ).strftime("%H:%M:%S")
+            await query.answer("✅ បានធ្វើបច្ចុប្បន្នភាព")
+            await show(query, f"{text_fn()}\n\n🕐 <i>បានធ្វើបច្ចុប្បន្នភាព: {now}</i>", refresh_kb(section))
         return
 
     await query.answer()
