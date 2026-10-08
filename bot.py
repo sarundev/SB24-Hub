@@ -1,5 +1,8 @@
+import html
+import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup, Update
@@ -8,13 +11,23 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 import data
+from football_api import CAMBODIA_TZ, FootballAPIError, FootballData
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_NAME = os.getenv("BOT_NAME", "Football Hub")
 
-CAMBODIA_TZ = timezone(timedelta(hours=7))  # ICT, no daylight saving
+# Free key from https://www.football-data.org/client/register — without it the bot shows demo data
+api = FootballData(os.getenv("FOOTBALL_DATA_KEY"))
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("football_hub")
+
+MAX_MATCHES = 20
+ERROR_TEXT = "⚠️ មិនអាចទាញទិន្នន័យបានទេនៅពេលនេះ។ សូមព្យាយាមម្តងទៀតបន្តិចទៀត។"
+DEMO_NOTE = "\n\n<i>⚠️ ទិន្នន័យគំរូ (Demo)</i>"
 
 RANK_EMOJI = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
@@ -85,24 +98,51 @@ def home_text():
     )
 
 
-def live_text():
-    if not data.LIVE_MATCHES:
-        return "🔴 <b>ប្រកួតបន្តផ្ទាល់</b>\n\nមិនមានការប្រកួតកំពុងលេងនៅពេលនេះទេ។"
-    blocks = [
-        f"🔴 <b>LIVE</b>\n⚽️ {m['home']} <b>{m['score']}</b> {m['away']}\n⏱️ {m['minute']}"
-        for m in data.LIVE_MATCHES
-    ]
+def team(name):
+    return html.escape(name)
+
+
+def grouped(matches, line_fn):
+    """Group matches under their league heading, in the same order as the league menu."""
+    shown = matches[:MAX_MATCHES]
+    blocks = []
+    for code, name in data.COMPETITION_NAMES.items():
+        lines = [line_fn(m) for m in shown if m["comp"] == code]
+        if lines:
+            blocks.append(f"<b>{name}</b>\n" + "\n\n".join(lines))
+    if len(matches) > MAX_MATCHES:
+        blocks.append(f"<i>… និង {len(matches) - MAX_MATCHES} ប្រកួតទៀត</i>")
     return "\n\n".join(blocks)
 
 
-def results_text():
-    lines = [f"⚽️ {m['home']} <b>{m['score']}</b> {m['away']}" for m in data.RESULTS]
-    return "📊 <b>លទ្ធផលថ្ងៃនេះ</b>\n\n" + "\n".join(lines)
+async def live_text():
+    title = "🔴 <b>ប្រកួតបន្តផ្ទាល់</b>\n\n"
+    matches = await api.live()
+    if not matches:
+        return title + "មិនមានការប្រកួតកំពុងលេងនៅពេលនេះទេ។"
+    return title + grouped(matches, lambda m: (
+        f"🔴 <b>LIVE</b>\n⚽️ {team(m['home'])} <b>{m['score']}</b> {team(m['away'])}\n⏱️ {m['minute']}"
+    ))
 
 
-def fixtures_text():
-    blocks = [f"⚽️ {m['home']} 🆚 {m['away']}\n🕐 {m['time']}" for m in data.FIXTURES]
-    return "📅 <b>ការប្រកួតបន្ទាប់</b>\n\n" + "\n\n".join(blocks)
+async def results_text():
+    title = "📊 <b>លទ្ធផលចុងក្រោយ</b>\n\n"
+    matches = await api.results()
+    if not matches:
+        return title + "មិនមានលទ្ធផលក្នុង ៣ ថ្ងៃចុងក្រោយទេ។"
+    return title + grouped(matches, lambda m: (
+        f"⚽️ {team(m['home'])} <b>{m['score']}</b> {team(m['away'])} <i>({m['date']})</i>"
+    ))
+
+
+async def fixtures_text():
+    title = "📅 <b>ការប្រកួតបន្ទាប់</b>\n\n"
+    matches = await api.fixtures()
+    if not matches:
+        return title + "មិនមានការប្រកួតក្នុង ៣ ថ្ងៃខាងមុខទេ។"
+    return title + grouped(matches, lambda m: (
+        f"⚽️ {team(m['home'])} 🆚 {team(m['away'])}\n🕐 {m['time']}"
+    ))
 
 
 def news_text():
@@ -118,12 +158,17 @@ def tables_text():
     return "🏆 <b>តារាងពិន្ទុ</b>\n\nសូមជ្រើសរើសលីគ 👇"
 
 
-def table_text(key):
+async def table_text(key):
     league = data.LEAGUES[key]
-    lines = [
-        f"{RANK_EMOJI[i]} {team} — <b>{pts} pts</b>"
-        for i, (team, pts) in enumerate(league["table"])
-    ]
+    rows = (await api.table(league["code"]))[:len(RANK_EMOJI)]
+    if not rows:
+        return f"<b>{league['name']}</b>\n\nមិនទាន់មានតារាងពិន្ទុនៅឡើយទេ។"
+    lines = []
+    for i, (name, pts, played) in enumerate(rows):
+        line = f"{RANK_EMOJI[i]} {team(name)} — <b>{pts} pts</b>"
+        if played is not None:
+            line += f" <i>({played} ប្រកួត)</i>"
+        lines.append(line)
     return f"<b>{league['name']}</b>\n\n" + "\n".join(lines)
 
 
@@ -140,7 +185,8 @@ def about_text():
         f"ℹ️ <b>អំពី {BOT_NAME}</b>\n\n"
         "Bot សម្រាប់តាមដានព័ត៌មានបាល់ទាត់ ⚽️\n"
         "🔴 ប្រកួតបន្តផ្ទាល់\n📊 លទ្ធផល\n📅 កាលវិភាគ\n📰 ព័ត៌មាន\n🏆 តារាងពិន្ទុ\n\n"
-        "📌 Version 1.0"
+        "📡 ទិន្នន័យពី football-data.org\n"
+        "📌 Version 1.1"
     )
 
 
@@ -163,6 +209,19 @@ async def show(query, text, markup):
             raise
 
 
+DATA_SECTIONS = {"live": live_text, "results": results_text, "fixtures": fixtures_text}
+
+
+async def load(text_fn):
+    """Build a screen that needs API data; show a friendly message if the API fails."""
+    try:
+        text = await text_fn()
+    except FootballAPIError as e:
+        log.warning("football-data.org error: %s", e)
+        return ERROR_TEXT
+    return text + DEMO_NOTE if api.demo else text
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     action = query.data
@@ -183,13 +242,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("🇰🇭 អ្នកកំពុងប្រើភាសាខ្មែរ")
         return
 
-    if action.startswith("refresh:"):
-        section = action.split(":", 1)[1]
-        text_fn = {"live": live_text, "results": results_text, "fixtures": fixtures_text}.get(section)
-        if text_fn:
+    if action.startswith("refresh:") or action in DATA_SECTIONS:
+        refreshing = action.startswith("refresh:")
+        section = action.split(":", 1)[1] if refreshing else action
+        text_fn = DATA_SECTIONS.get(section)
+        if not text_fn:
+            await query.answer()
+            return
+        await query.answer("✅ បានធ្វើបច្ចុប្បន្នភាព" if refreshing else None)
+        text = await load(text_fn)
+        if refreshing:
             now = datetime.now(CAMBODIA_TZ).strftime("%H:%M:%S")
-            await query.answer("✅ បានធ្វើបច្ចុប្បន្នភាព")
-            await show(query, f"{text_fn()}\n\n🕐 <i>បានធ្វើបច្ចុប្បន្នភាព: {now}</i>", refresh_kb(section))
+            text += f"\n\n🕐 <i>បានធ្វើបច្ចុប្បន្នភាព: {now}</i>"
+        await show(query, text, refresh_kb(section))
         return
 
     await query.answer()
@@ -197,14 +262,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if action.startswith("table:"):
         key = action.split(":", 1)[1]
         if key in data.LEAGUES:
-            await show(query, table_text(key), table_kb())
+            await show(query, await load(lambda: table_text(key)), table_kb())
         return
 
     screens = {
         "home": (home_text, home_kb),
-        "live": (live_text, lambda: refresh_kb("live")),
-        "results": (results_text, lambda: refresh_kb("results")),
-        "fixtures": (fixtures_text, lambda: refresh_kb("fixtures")),
         "news": (news_text, news_kb),
         "tables": (tables_text, leagues_kb),
         "settings": (settings_text, lambda: settings_kb(notify_on)),
@@ -224,7 +286,8 @@ def main() -> None:
     app.add_handler(CommandHandler(["start", "menu"], start))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    print(f"⚽️ {BOT_NAME} (KH) is running... (Ctrl+C to stop)")
+    mode = "DEMO data (no FOOTBALL_DATA_KEY)" if api.demo else "live data from football-data.org"
+    print(f"⚽️ {BOT_NAME} (KH) is running with {mode}... (Ctrl+C to stop)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
